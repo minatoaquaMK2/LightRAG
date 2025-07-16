@@ -1,5 +1,5 @@
 """
-LightRAG FastAPI Server
+LightRAG FastAPI Server with RAGAnything Integration
 """
 
 from fastapi import FastAPI, Depends, HTTPException, status
@@ -33,6 +33,7 @@ from lightrag import LightRAG, __version__ as core_version
 from lightrag.api import __api_version__
 from lightrag.types import GPTKeywordExtractionFormat
 from lightrag.utils import EmbeddingFunc
+from raganything import RAGAnything
 from lightrag.constants import (
     DEFAULT_LOG_MAX_BYTES,
     DEFAULT_LOG_BACKUP_COUNT,
@@ -46,6 +47,7 @@ from lightrag.api.routers.document_routes import (
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.routers.raganything_routes import create_raganything_routes
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -124,7 +126,7 @@ def create_app(args):
 
         try:
             # Initialize database connections
-            await rag.initialize_storages()
+            await rag.lightrag.initialize_storages()
 
             await initialize_pipeline_status()
             pipeline_status = await get_namespace_data("pipeline_status")
@@ -140,7 +142,7 @@ def create_app(args):
             # Only run auto scan when no other process started it first
             if should_start_autoscan:
                 # Create background task
-                task = asyncio.create_task(run_scanning_process(rag, doc_manager))
+                task = asyncio.create_task(run_scanning_process(rag.lightrag, doc_manager))
                 app.state.background_tasks.add(task)
                 task.add_done_callback(app.state.background_tasks.discard)
                 logger.info(f"Process {os.getpid()} auto scan task started at startup.")
@@ -151,12 +153,12 @@ def create_app(args):
 
         finally:
             # Clean up database connections
-            await rag.finalize_storages()
+            await rag.lightrag.finalize_storages()
 
     # Initialize FastAPI
     app_kwargs = {
-        "title": "LightRAG Server API",
-        "description": "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
+        "title": "LightRAG Server API with RAGAnything",
+        "description": "Providing API for LightRAG core with RAGAnything multimodal support, Web UI and Ollama Model Emulation"
         + "(With authentication)"
         if api_key
         else "",
@@ -320,9 +322,151 @@ def create_app(args):
             "Rerank model not configured. Set RERANK_BINDING_API_KEY and RERANK_BINDING_HOST to enable reranking."
         )
 
+    # Configure vision model function for RAGAnything multimodal processing
+    async def vision_model_func(
+        prompt,
+        system_prompt=None,
+        history_messages=None,
+        image_data=None,
+        **kwargs
+    ) -> str:
+        """Vision model function for multimodal processing with independent configuration"""
+        if history_messages is None:
+            history_messages = []
+        
+        # Get RAGAnything-specific configuration from environment variables
+        # If not set, fall back to main LLM configuration
+        rag_llm_binding = os.getenv("RAGANYTHING_LLM_BINDING") or args.llm_binding
+        rag_llm_model = os.getenv("RAGANYTHING_LLM_MODEL") or args.llm_model
+        rag_llm_host = os.getenv("RAGANYTHING_LLM_BINDING_HOST") or args.llm_binding_host
+        rag_llm_api_key = os.getenv("RAGANYTHING_LLM_BINDING_API_KEY") or args.llm_binding_api_key
+        rag_temperature = float(os.getenv("RAGANYTHING_TEMPERATURE", args.temperature))
+        
+        # Azure-specific RAGAnything configuration
+        rag_azure_api_version = os.getenv("RAGANYTHING_AZURE_OPENAI_API_VERSION") or os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+        rag_azure_deployment = os.getenv("RAGANYTHING_AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT")
+        
+        logger.info(f"RAGAnything vision model config: binding={rag_llm_binding}, model={rag_llm_model}, host={rag_llm_host}")
+        
+        # Use appropriate model based on RAGAnything binding configuration
+        if rag_llm_binding == "openai":
+            if image_data:
+                # For multimodal queries with images, use vision-capable model
+                vision_model = rag_llm_model if "gpt-4" in rag_llm_model else "gpt-4o"  # Ensure vision capability
+                kwargs["temperature"] = rag_temperature
+                return await openai_complete_if_cache(
+                    vision_model,
+                    "",
+                    system_prompt=None,
+                    history_messages=[],
+                    messages=[
+                        {"role": "system", "content": system_prompt} if system_prompt else None,
+                        {"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                        ]}
+                    ],
+                    base_url=rag_llm_host,
+                    api_key=rag_llm_api_key,
+                    **kwargs,
+                )
+            else:
+                # For text-only queries, use the configured model
+                kwargs["temperature"] = rag_temperature
+                return await openai_complete_if_cache(
+                    rag_llm_model,
+                    prompt,
+                    system_prompt=system_prompt,
+                    history_messages=history_messages,
+                    base_url=rag_llm_host,
+                    api_key=rag_llm_api_key,
+                    **kwargs,
+                )
+        elif rag_llm_binding == "azure_openai":
+            if image_data:
+                # For multimodal queries with images
+                vision_model = rag_azure_deployment or rag_llm_model
+                if "gpt-4" not in vision_model:
+                    vision_model = "gpt-4o"  # Ensure vision capability
+                kwargs["temperature"] = rag_temperature
+                return await azure_openai_complete_if_cache(
+                    vision_model,
+                    "",
+                    system_prompt=None,
+                    history_messages=[],
+                    messages=[
+                        {"role": "system", "content": system_prompt} if system_prompt else None,
+                        {"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                        ]}
+                    ],
+                    base_url=rag_llm_host,
+                    api_key=rag_llm_api_key or os.getenv("AZURE_OPENAI_API_KEY"),
+                    api_version=rag_azure_api_version,
+                    **kwargs,
+                )
+            else:
+                # For text-only queries
+                kwargs["temperature"] = rag_temperature
+                return await azure_openai_complete_if_cache(
+                    rag_azure_deployment or rag_llm_model,
+                    prompt,
+                    system_prompt=system_prompt,
+                    history_messages=history_messages,
+                    base_url=rag_llm_host,
+                    api_key=rag_llm_api_key or os.getenv("AZURE_OPENAI_API_KEY"),
+                    api_version=rag_azure_api_version,
+                    **kwargs,
+                )
+        else:
+            # For non-OpenAI bindings, fall back to OpenAI for vision tasks if image_data is provided
+            if image_data:
+                logger.warning(f"Binding {rag_llm_binding} doesn't support vision. Falling back to OpenAI for multimodal tasks.")
+                # Use OpenAI as fallback for vision tasks
+                fallback_api_key = os.getenv("OPENAI_API_KEY") or rag_llm_api_key
+                if not fallback_api_key:
+                    raise ValueError("Vision tasks require OpenAI API key when using non-OpenAI bindings")
+                kwargs["temperature"] = rag_temperature
+                return await openai_complete_if_cache(
+                    "gpt-4o",
+                    "",
+                    system_prompt=None,
+                    history_messages=[],
+                    messages=[
+                        {"role": "system", "content": system_prompt} if system_prompt else None,
+                        {"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                        ]}
+                    ],
+                    base_url="https://api.openai.com/v1",
+                    api_key=fallback_api_key,
+                    **kwargs,
+                )
+            else:
+                # For text-only queries with non-OpenAI bindings, use the main LLM
+                if rag_llm_binding == "lollms":
+                    return await lollms_model_complete(
+                        prompt, 
+                        system_prompt=system_prompt, 
+                        history_messages=history_messages, 
+                        **kwargs
+                    )
+                elif rag_llm_binding == "ollama":
+                    return await ollama_model_complete(
+                        prompt, 
+                        system_prompt=system_prompt, 
+                        history_messages=history_messages, 
+                        **kwargs
+                    )
+                else:
+                    raise ValueError(f"Unsupported LLM binding for RAGAnything: {rag_llm_binding}")
+
     # Initialize RAG
     if args.llm_binding in ["lollms", "ollama", "openai"]:
-        rag = LightRAG(
+        # First create LightRAG instance
+        lightrag_instance = LightRAG(
             working_dir=args.working_dir,
             workspace=args.workspace,
             llm_model_func=lollms_model_complete
@@ -359,8 +503,15 @@ def create_app(args):
             max_graph_nodes=args.max_graph_nodes,
             addon_params={"language": args.summary_language},
         )
+        
+        # Then create RAGAnything instance with the LightRAG instance
+        rag = RAGAnything(
+            lightrag=lightrag_instance,
+            vision_model_func=vision_model_func,
+        )
     else:  # azure_openai
-        rag = LightRAG(
+        # First create LightRAG instance
+        lightrag_instance = LightRAG(
             working_dir=args.working_dir,
             workspace=args.workspace,
             llm_model_func=azure_openai_model_complete,
@@ -388,20 +539,30 @@ def create_app(args):
             max_graph_nodes=args.max_graph_nodes,
             addon_params={"language": args.summary_language},
         )
+        
+        # Then create RAGAnything instance with the LightRAG instance
+        rag = RAGAnything(
+            lightrag=lightrag_instance,
+            vision_model_func=vision_model_func,
+        )
 
     # Add routes
     app.include_router(
         create_document_routes(
-            rag,
+            rag.lightrag,
             doc_manager,
             api_key,
         )
     )
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(create_query_routes(rag.lightrag, api_key, args.top_k))
+    app.include_router(create_graph_routes(rag.lightrag, api_key))
+    
+    # Add RAGAnything multimodal routes
+    raganything_router = create_raganything_routes(rag, api_key)
+    app.include_router(raganything_router, prefix="/raganything")
 
     # Add Ollama API routes
-    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
+    ollama_api = OllamaAPI(rag.lightrag, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
 
     @app.get("/")
@@ -668,6 +829,7 @@ def check_and_install_dependencies():
         "uvicorn",
         "tiktoken",
         "fastapi",
+        "raganything",
         # Add other required packages here
     ]
 

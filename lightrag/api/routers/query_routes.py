@@ -157,7 +157,16 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         """
         try:
             param = request.to_query_params(False)
-            response = await rag.aquery(request.query, param=param)
+            
+            # Use RAGAnything's multimodal query if available for enhanced capabilities
+            if rag_anything is not None:
+                response = await rag_anything.query_with_multimodal(
+                    request.query, 
+                    mode=request.mode
+                )
+            else:
+                # Fallback to regular LightRAG query
+                response = await rag.aquery(request.query, param=param)
 
             # If response is a string (e.g. cache hit), return directly
             if isinstance(response, str):
